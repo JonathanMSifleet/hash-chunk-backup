@@ -1,6 +1,6 @@
 # Settings
-$sourcePath = "S:\"                        # Source drive to read files from
-$targetPath = "T:\ChunkStorage"            # Target folder to store chunk files and manifest
+$sourcePath = "C:\Media\Zips"                        # Source drive to read files from
+$targetPath = "S:\TestBackup"            # Target folder to store chunk files and manifest
 $chunkSize = 1GB                           # Chunk size (1 gigabyte)
 $manifestFile = Join-Path $targetPath "manifest.json"  # Manifest JSON file path
 
@@ -11,7 +11,14 @@ if (-not (Test-Path $targetPath)) {
 
 # Load existing manifest or create empty one
 if (Test-Path $manifestFile) {
-    $manifest = Get-Content $manifestFile -Raw | ConvertFrom-Json
+    $json = Get-Content $manifestFile -Raw | ConvertFrom-Json
+    $manifest = @{}
+    foreach ($key in $json.PSObject.Properties.Name) {
+        $manifest[$key] = @{}
+        foreach ($subkey in $json.$key.PSObject.Properties.Name) {
+            $manifest[$key][$subkey] = $json.$key.$subkey
+        }
+    }
 } else {
     $manifest = @{}
 }
@@ -51,7 +58,8 @@ Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
         while (($bytesRead = $stream.Read($buffer, 0, $chunkSize)) -gt 0) {
             # If last chunk is smaller than chunkSize, resize buffer accordingly
             if ($bytesRead -lt $chunkSize) {
-                $chunkData = $buffer[0..($bytesRead - 1)]
+                $chunkData = New-Object byte[] $bytesRead
+                [Array]::Copy($buffer, 0, $chunkData, 0, $bytesRead)
             } else {
                 $chunkData = $buffer
             }
