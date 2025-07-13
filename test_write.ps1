@@ -69,7 +69,7 @@ function Write-ChunkFile {
   $extension = [System.IO.Path]::GetExtension($fileName)
   $chunkFileName = "$baseName-$chunkName$extension.bin"
   $chunkFilePath = Join-Path $targetDir $chunkFileName
-  [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
+  [System.IO.File]::WriteAllBytes($chunkFilePath,$chunkData)
 }
 
 function Process-Chunk {
@@ -131,8 +131,8 @@ function Print-PerformanceStatsForChunk {
   $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
 
   Write-Host "$timestamp - Chunk $chunkIndex performance:"
-  Write-Host ("  Read time: {0:N3} s, Read size: {1} bytes, Read speed: {2:N2} MB/s" -f $readTime, $readBytes, $readSpeed)
-  Write-Host ("  Write time: {0:N3} s, Write size: {1} bytes, Write speed: {2:N2} MB/s" -f $writeTime, $writeBytes, $writeSpeed)
+  Write-Host ("  Read time: {0:N3} s, Read size: {1} bytes, Read speed: {2:N2} MB/s" -f $readTime,$readBytes,$readSpeed)
+  Write-Host ("  Write time: {0:N3} s, Write size: {1} bytes, Write speed: {2:N2} MB/s" -f $writeTime,$writeBytes,$writeSpeed)
   Write-Host ""
 }
 
@@ -155,15 +155,16 @@ function Process-File {
   try {
     $buffer = New-Object byte[] $chunkSize
     $chunkIndex = 0
-    while (($bytesRead = $stream.Read($buffer, 0, $chunkSize)) -gt 0) {
+    $allChunks = @()
+    $chunkIndex = 0
+    while (($bytesRead = $stream.Read($buffer,0,$chunkSize)) -gt 0) {
       $readStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
       if ($bytesRead -eq $chunkSize) {
-        $chunkData = $buffer
-      }
-      else {
+        $chunkData = $buffer.Clone()
+      } else {
         $chunkData = New-Object byte[] $bytesRead
-        [System.Buffer]::BlockCopy($buffer, 0, $chunkData, 0, $bytesRead)
+        [System.Buffer]::BlockCopy($buffer,0,$chunkData,0,$bytesRead)
       }
 
       $readStopwatch.Stop()
@@ -171,13 +172,26 @@ function Process-File {
       $performance.ReadSizes += $bytesRead
 
       $chunkName = "chunk$chunkIndex"
-      Process-Chunk -FileName $fileName -chunkName $chunkName -chunkData $chunkData -manifest $manifest -targetPath $targetPath -counters $counters
-
-      # Print incremental performance stats for this chunk
-      Print-PerformanceStatsForChunk -chunkIndex $chunkIndex
+      $allChunks += [pscustomobject]@{
+        FileName = $fileName
+        ChunkName = $chunkName
+        ChunkData = $chunkData
+        ChunkIndex = $chunkIndex
+      }
 
       $chunkIndex++
     }
+
+    $stream.Dispose()
+
+    # Process chunks in parallel
+    $allChunks | ForEach-Object -Parallel {
+      param($manifest,$targetPath,$counters,$performance)
+
+      Process-Chunk -FileName $_.FileName -chunkName $_.ChunkName -chunkData $_.ChunkData -manifest $using:manifest -targetPath $using:targetPath -counters $using:counters
+      Print-PerformanceStatsForChunk -chunkIndex $_.ChunkIndex
+
+    } -ThrottleLimit 4
   }
   finally {
     $stream.Dispose()
@@ -265,7 +279,7 @@ function Main {
 
   $counters = @{
     Total = 0
-    New = 0
+    new = 0
     Updated = 0
     Untouched = 0
     Outdated = 0
@@ -299,4 +313,10 @@ function Main {
   Print-PerformanceStats
 }
 
+# Run Main and measure total time
+$scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
 Main
+
+$scriptStopwatch.Stop()
+Write-Host ("Total time elapsed: {0:N2} seconds" -f $scriptStopwatch.Elapsed.TotalSeconds)
