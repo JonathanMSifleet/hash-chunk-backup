@@ -1,7 +1,7 @@
 # Settings
 $sourcePath = "C:\Media\Zips"                        # Source drive to read files from
-$targetPath = "S:\TestBackup"            # Target folder to store chunk files and manifest
-$chunkSize = 1GB                           # Chunk size (1 gigabyte)
+$targetPath = "S:\TestBackup"                        # Target folder to store chunk files and manifest
+$chunkSize = 1GB                                     # Chunk size (1 gigabyte)
 $manifestFile = Join-Path $targetPath "manifest.json"  # Manifest JSON file path
 
 # Create target folder if it doesn't exist
@@ -37,11 +37,15 @@ $updatedChunks = 0
 $newChunks = 0
 $untouchedChunks = 0
 
+# Track source files processed this run
+$processedFiles = @{}
+
 # Process each file recursively under sourcePath
 Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
     $file = $_
     $filePath = $file.FullName
     $fileName = $file.Name
+    $processedFiles[$fileName] = $true
 
     Write-Host "Processing file: $filePath"
 
@@ -61,7 +65,7 @@ Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
                 $chunkData = New-Object byte[] $bytesRead
                 [Array]::Copy($buffer, 0, $chunkData, 0, $bytesRead)
             } else {
-                $chunkData = $buffer
+                $chunkData = $buffer.Clone()
             }
 
             # Compute chunk hash
@@ -70,33 +74,23 @@ Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
             # Create chunk identifier string
             $chunkName = "chunk$chunkIndex"
 
+            # Construct chunk file name
+            $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+            $fileExtension = [System.IO.Path]::GetExtension($fileName)
+            $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
+            $chunkFilePath = Join-Path $targetPath $chunkFileName
+
             # Check if chunk is new or changed
             if (-not $manifest[$fileName].ContainsKey($chunkName)) {
                 Write-Host "  Creating new chunk #$chunkIndex (Hash: $chunkHash)"
                 $manifest[$fileName][$chunkName] = $chunkHash
-
-                # Save chunk binary to target folder
-                $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-                $fileExtension = [System.IO.Path]::GetExtension($fileName)
-                $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
-                $chunkFilePath = Join-Path $targetPath $chunkFileName
-
                 [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-
                 $newChunks++
             }
             elseif ($manifest[$fileName][$chunkName] -ne $chunkHash) {
                 Write-Host "  Updating chunk #$chunkIndex (Hash: $chunkHash)"
                 $manifest[$fileName][$chunkName] = $chunkHash
-
-                # Save chunk binary to target folder
-                $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-                $fileExtension = [System.IO.Path]::GetExtension($fileName)
-                $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
-                $chunkFilePath = Join-Path $targetPath $chunkFileName
-
                 [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-
                 $updatedChunks++
             }
             else {
@@ -114,21 +108,26 @@ Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
     }
 }
 
-# Identify and remove outdated chunks
+# Cleanup: Remove orphaned manifest entries and unused chunk files
 $outdatedChunks = 0
 $existingChunkFiles = @{}
+$validManifest = @{}
 
-# Track all currently valid chunk file names
 foreach ($fileName in $manifest.Keys) {
-    $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-    $fileExtension = [System.IO.Path]::GetExtension($fileName)
-    foreach ($chunkName in $manifest[$fileName].Keys) {
-        $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
-        $existingChunkFiles[$chunkFileName] = $true
+    if ($processedFiles.ContainsKey($fileName)) {
+        $validManifest[$fileName] = $manifest[$fileName]
+        $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+        $fileExtension = [System.IO.Path]::GetExtension($fileName)
+        foreach ($chunkName in $manifest[$fileName].Keys) {
+            $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
+            $existingChunkFiles[$chunkFileName] = $true
+        }
+    } else {
+        Write-Host "Removing manifest entry for deleted source file: $fileName"
     }
 }
 
-# Delete any .bin files in the target directory not referenced in the updated manifest
+# Delete unreferenced .bin files
 Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
     if (-not $existingChunkFiles.ContainsKey($_.Name)) {
         Write-Host "  Removing outdated chunk: $($_.FullName)"
@@ -137,8 +136,8 @@ Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
     }
 }
 
-# Save updated manifest
-$manifest | ConvertTo-Json -Depth 10 | Set-Content $manifestFile
+# Save cleaned manifest
+$validManifest | ConvertTo-Json -Depth 10 | Set-Content $manifestFile
 
 # Summary output
 Write-Host "`nChunking complete."
