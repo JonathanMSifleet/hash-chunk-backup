@@ -1,8 +1,13 @@
 # Settings
 $sourcePath = "C:\Media\Zips"
 $targetPath = "S:\TestBackup"
-$chunkSize = 1GB
 $manifestFile = Join-Path $targetPath "manifest.json"
+
+# Chunk size settings
+$avgChunkSizeMB = 256
+$maxChunkSizeMB = 1024
+$avgChunkSize = $avgChunkSizeMB * 1MB
+$maxChunkSize = $maxChunkSizeMB * 1MB
 
 # Performance tracking
 $performance = @{
@@ -23,16 +28,30 @@ function Load-Manifest {
   param([string]$path)
   if (Test-Path $path) {
     $json = Get-Content $path -Raw | ConvertFrom-Json
-    $manifest = @{}
-    foreach ($file in $json.PSObject.Properties.Name) {
-      $manifest[$file] = @{}
-      foreach ($chunk in $json.$file.PSObject.Properties.Name) {
-        $manifest[$file][$chunk] = $json.$file.$chunk
+    function ConvertToHashtable ($obj) {
+      if ($obj -is [System.Management.Automation.PSCustomObject]) {
+        $ht = @{}
+        foreach ($prop in $obj.PSObject.Properties) {
+          $ht[$prop.Name] = ConvertToHashtable $prop.Value
+        }
+        return $ht
+      }
+      elseif ($obj -is [System.Collections.IDictionary]) {
+        $ht = @{}
+        foreach ($key in $obj.Keys) {
+          $ht[$key] = ConvertToHashtable $obj[$key]
+        }
+        return $ht
+      }
+      else {
+        return $obj
       }
     }
-    return $manifest
+    return ConvertToHashtable $json
   }
-  return @{}
+  else {
+    return @{}
+  }
 }
 
 function Save-Manifest {
@@ -69,119 +88,7 @@ function Write-ChunkFile {
   $extension = [System.IO.Path]::GetExtension($fileName)
   $chunkFileName = "$baseName-$chunkName$extension.bin"
   $chunkFilePath = Join-Path $targetDir $chunkFileName
-  [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-}
-
-function Process-Chunk {
-  param(
-    [string]$fileName,
-    [string]$chunkName,
-    [byte[]]$chunkData,
-    [hashtable]$manifest,
-    [string]$targetPath,
-    [hashtable]$counters
-  )
-
-  $chunkHash = Get-Hash $chunkData
-
-  $writeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-  if (-not $manifest[$fileName].ContainsKey($chunkName)) {
-    Write-Host "  Creating new chunk $chunkName (Hash: $chunkHash)"
-    $manifest[$fileName][$chunkName] = $chunkHash
-    Write-ChunkFile -targetDir $targetPath -FileName $fileName -chunkName $chunkName -chunkData $chunkData
-    $counters["New"]++
-  }
-  elseif ($manifest[$fileName][$chunkName] -ne $chunkHash) {
-    Write-Host "  Updating chunk $chunkName (Hash: $chunkHash)"
-    $manifest[$fileName][$chunkName] = $chunkHash
-    Write-ChunkFile -targetDir $targetPath -FileName $fileName -chunkName $chunkName -chunkData $chunkData
-    $counters["Updated"]++
-  }
-  else {
-    Write-Host "  Chunk $chunkName unchanged, skipping."
-    $writeStopwatch.Stop()
-    # Skipped write, record no time or size for write
-    $counters["Untouched"]++
-    return
-  }
-
-  $writeStopwatch.Stop()
-  $performance.WriteTimes += $writeStopwatch.Elapsed.TotalSeconds
-  $performance.WriteSizes += $chunkData.Length
-}
-
-function Print-PerformanceStatsForChunk {
-  param([int]$chunkIndex)
-
-  $readTime = $performance.ReadTimes[$chunkIndex]
-  $readBytes = $performance.ReadSizes[$chunkIndex]
-
-  if ($chunkIndex -lt $performance.WriteTimes.Count) {
-    $writeTime = $performance.WriteTimes[$chunkIndex]
-    $writeBytes = $performance.WriteSizes[$chunkIndex]
-  } else {
-    $writeTime = 0
-    $writeBytes = 0
-  }
-
-  $readSpeed = if ($readTime -gt 0) { $readBytes / $readTime / 1MB } else { 0 }
-  $writeSpeed = if ($writeTime -gt 0) { $writeBytes / $writeTime / 1MB } else { 0 }
-
-  $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-
-  Write-Host "$timestamp - Chunk $chunkIndex performance:"
-  Write-Host ("  Read time: {0:N3} s, Read size: {1} bytes, Read speed: {2:N2} MB/s" -f $readTime, $readBytes, $readSpeed)
-  Write-Host ("  Write time: {0:N3} s, Write size: {1} bytes, Write speed: {2:N2} MB/s" -f $writeTime, $writeBytes, $writeSpeed)
-  Write-Host ""
-}
-
-function Process-File {
-  param(
-    [System.IO.FileInfo]$file,
-    [hashtable]$manifest,
-    [string]$targetPath,
-    [int64]$chunkSize,
-    [hashtable]$counters
-  )
-  $fileName = $file.Name
-
-  if (-not $manifest.ContainsKey($fileName)) {
-    $manifest[$fileName] = @{}
-  }
-
-  Write-Host "Processing file: $($file.FullName)"
-  $stream = [System.IO.File]::OpenRead($file.FullName)
-  try {
-    $buffer = New-Object byte[] $chunkSize
-    $chunkIndex = 0
-    while (($bytesRead = $stream.Read($buffer, 0, $chunkSize)) -gt 0) {
-      $readStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-      if ($bytesRead -eq $chunkSize) {
-        $chunkData = $buffer
-      }
-      else {
-        $chunkData = New-Object byte[] $bytesRead
-        [System.Buffer]::BlockCopy($buffer, 0, $chunkData, 0, $bytesRead)
-      }
-
-      $readStopwatch.Stop()
-      $performance.ReadTimes += $readStopwatch.Elapsed.TotalSeconds
-      $performance.ReadSizes += $bytesRead
-
-      $chunkName = "chunk$chunkIndex"
-      Process-Chunk -FileName $fileName -chunkName $chunkName -chunkData $chunkData -manifest $manifest -targetPath $targetPath -counters $counters
-
-      # Print incremental performance stats for this chunk
-      Print-PerformanceStatsForChunk -chunkIndex $chunkIndex
-
-      $chunkIndex++
-    }
-  }
-  finally {
-    $stream.Dispose()
-  }
+  [System.IO.File]::WriteAllBytes($chunkFilePath,$chunkData)
 }
 
 function Cleanup-OrphanChunks {
@@ -190,7 +97,6 @@ function Cleanup-OrphanChunks {
     [string]$targetPath,
     [hashtable]$counters
   )
-  # Build set of valid chunk file names
   $validChunks = @{}
   foreach ($fileName in $manifest.Keys) {
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
@@ -201,7 +107,6 @@ function Cleanup-OrphanChunks {
     }
   }
 
-  # Remove orphaned chunk files
   Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
     if (-not $validChunks.ContainsKey($_.Name)) {
       Write-Host "  Removing outdated chunk: $($_.FullName)"
@@ -218,13 +123,8 @@ function Print-PerformanceStats {
   $totalWriteBytes = ($performance.WriteSizes | Measure-Object -Sum).Sum
   $totalChunks = $performance.ReadTimes.Count
 
-  if ($totalReadTime -gt 0) {
-    $avgReadSpeed = $totalReadBytes / $totalReadTime / 1MB
-  } else { $avgReadSpeed = 0 }
-
-  if ($totalWriteTime -gt 0) {
-    $avgWriteSpeed = $totalWriteBytes / $totalWriteTime / 1MB
-  } else { $avgWriteSpeed = 0 }
+  $avgReadSpeed = if ($totalReadTime -gt 0) { $totalReadBytes / $totalReadTime / 1MB } else { 0 }
+  $avgWriteSpeed = if ($totalWriteTime -gt 0) { $totalWriteBytes / $totalWriteTime / 1MB } else { 0 }
 
   $peakReadSpeed = 0
   for ($i = 0; $i -lt $totalChunks; $i++) {
@@ -258,45 +158,133 @@ function Print-PerformanceStats {
   Write-Host "=========================`n"
 }
 
-function Main {
-  Ensure-TargetDirectory -Path $targetPath
+function Process-File {
+  param(
+    [System.IO.FileInfo]$file,
+    [hashtable]$manifest,
+    [string]$targetPath,
+    [int64]$avgChunkSize,
+    [int64]$maxChunkSize,
+    [hashtable]$counters
+  )
+  $fileName = $file.Name
 
-  $manifest = Load-Manifest -Path $manifestFile
-
-  $counters = @{
-    Total = 0
-    New = 0
-    Updated = 0
-    Untouched = 0
-    Outdated = 0
+  if (-not $manifest.ContainsKey($fileName)) {
+    $manifest[$fileName] = @{}
   }
 
-  $processedFiles = @{}
+  Write-Host "Processing file: $($file.FullName)"
+  $stream = [System.IO.File]::OpenRead($file.FullName)
 
-  # Process each file
-  Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
-    $processedFiles[$_.Name] = $true
-    Process-File -File $_ -manifest $manifest -targetPath $targetPath -chunkSize $chunkSize -counters $counters
+  try {
+    $chunks = @()
+    $chunkIndex = 0
+    $bufferSize = $avgChunkSize
+    $buffer = New-Object byte[] $bufferSize
+
+    while (($bytesRead = $stream.Read($buffer,0,$bufferSize)) -gt 0) {
+      $chunkData = New-Object byte[] $bytesRead
+      [System.Buffer]::BlockCopy($buffer,0,$chunkData,0,$bytesRead)
+
+      $chunks += [pscustomobject]@{
+        Index = $chunkIndex
+        Data = $chunkData
+      }
+
+      $chunkIndex++
+
+      $remainingBytes = $stream.Length - $stream.Position
+      if ($remainingBytes -lt $bufferSize) {
+        $bufferSize = [math]::Min($remainingBytes,$maxChunkSize)
+        if ($bufferSize -le 0) { break }
+        $buffer = New-Object byte[] $bufferSize
+      }
+    }
+  }
+  finally {
+    $stream.Dispose()
   }
 
-  # Remove manifest entries for missing files
-  $manifest.Keys | Where-Object { -not $processedFiles.ContainsKey($_) } | ForEach-Object {
-    Write-Host "Removing obsolete manifest entry: $_"
-    $manifest.Remove($_)
+  $maxThreads = [Environment]::ProcessorCount
+
+  Write-Host "Calculating hashes for $chunkIndex chunks in parallel with $maxThreads threads..."
+
+  # Step 1: Calculate hashes in parallel
+  $chunkResults = $chunks | ForEach-Object -Parallel {
+    function Get-Hash {
+      param([byte[]]$data)
+      $sha256 = [System.Security.Cryptography.SHA256]::Create()
+      try {
+        $hashBytes = $sha256.ComputeHash($data)
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-","").ToLower()
+      }
+      finally {
+        $sha256.Dispose()
+      }
+    }
+    [pscustomobject]@{
+      Index = $_.Index
+      Hash = Get-Hash $_.Data
+      Data = $_.Data
+    }
+  } -ThrottleLimit $maxThreads
+
+  # Step 2: Sequentially write chunks and update manifest
+  foreach ($chunk in $chunkResults) {
+    $chunkName = $chunk.Index.ToString() # No leading zeros now
+    $chunkHash = $chunk.Hash
+    $chunkData = $chunk.Data
+
+    if (-not $manifest.ContainsKey($fileName)) {
+      $manifest[$fileName] = @{}
+    }
+
+    if (-not $manifest[$fileName].ContainsKey($chunkName)) {
+      Write-Host "  Creating new chunk $chunkName (Hash: $chunkHash)"
+      $manifest[$fileName][$chunkName] = $chunkHash
+      Write-ChunkFile -targetDir $targetPath -FileName $fileName -chunkName $chunkName -chunkData $chunkData
+      $counters["New"]++
+    }
+    elseif ($manifest[$fileName][$chunkName] -ne $chunkHash) {
+      Write-Host "  Updating chunk $chunkName (Hash changed)"
+      $manifest[$fileName][$chunkName] = $chunkHash
+      Write-ChunkFile -targetDir $targetPath -FileName $fileName -chunkName $chunkName -chunkData $chunkData
+      $counters["Updated"]++
+    }
+    else {
+      $counters["Unchanged"]++
+    }
   }
 
-  Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath -counters $counters
-
-  Save-Manifest -manifest $manifest -Path $manifestFile
-
-  Write-Host "`nChunking complete."
-  Write-Host "Total chunks processed: $($performance.ReadTimes.Count)"
-  Write-Host "New chunks created: $($counters.New)"
-  Write-Host "Chunks updated: $($counters.Updated)"
-  Write-Host "Chunks untouched: $($counters.Untouched)"
-  Write-Host "Chunks removed: $($counters.Outdated)"
-
-  Print-PerformanceStats
 }
 
-Main
+# Main script
+
+Ensure-TargetDirectory -Path $targetPath
+$manifest = Load-Manifest -Path $manifestFile
+
+$counters = @{
+  new = 0
+  Updated = 0
+  Unchanged = 0
+  Outdated = 0
+}
+
+# Get all files recursively from sourcePath
+$files = Get-ChildItem -Path $sourcePath -File -Recurse
+
+foreach ($file in $files) {
+  Process-File -File $file -manifest $manifest -targetPath $targetPath -avgChunkSize $avgChunkSize -maxChunkSize $maxChunkSize -counters $counters
+}
+
+Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath -counters $counters
+
+Save-Manifest -manifest $manifest -Path $manifestFile
+
+Write-Host "`nSummary:"
+Write-Host "  New chunks created: $($counters.New)"
+Write-Host "  Chunks updated: $($counters.Updated)"
+Write-Host "  Chunks unchanged: $($counters.Unchanged)"
+Write-Host "  Outdated chunks removed: $($counters.Outdated)"
+
+Print-PerformanceStats
