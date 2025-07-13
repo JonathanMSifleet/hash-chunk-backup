@@ -13,14 +13,14 @@ $performance = @{
   WriteSizes = @()
 }
 
-function Ensure-TargetDirectory {
+function Initialize-TargetDirectory {
   param([string]$path)
   if (-not (Test-Path $path)) {
     New-Item -ItemType Directory -Path $path -Force | Out-Null
   }
 }
 
-function Load-Manifest {
+function Get-Manifest {
   param([string]$path)
   if (Test-Path $path) {
     $json = Get-Content $path -Raw | ConvertFrom-Json
@@ -73,7 +73,7 @@ function Write-ChunkFile {
   [System.IO.File]::WriteAllBytes($chunkFilePath,$chunkData)
 }
 
-function Process-Chunk {
+function Invoke-Chunk {
   param(
     [string]$fileName,
     [string]$chunkName,
@@ -112,7 +112,7 @@ function Process-Chunk {
   $performance.WriteSizes += $chunkData.Length
 }
 
-function Print-PerformanceStatsForChunk {
+function Show-PerformanceStatsForChunk {
   param([int]$chunkIndex)
 
   $readTime = $performance.ReadTimes[$chunkIndex]
@@ -137,7 +137,7 @@ function Print-PerformanceStatsForChunk {
   Write-Host ""
 }
 
-function Process-File {
+function Invoke-File {
   param(
     [System.IO.FileInfo]$file,
     [hashtable]$manifest,
@@ -189,8 +189,8 @@ function Process-File {
     $allChunks | ForEach-Object -Parallel {
       param($manifest,$targetPath,$counters,$performance)
 
-      Process-Chunk -FileName $_.FileName -chunkName $_.ChunkName -chunkData $_.ChunkData -manifest $using:manifest -targetPath $using:targetPath -counters $using:counters
-      Print-PerformanceStatsForChunk -chunkIndex $_.ChunkIndex
+      Invoke-Chunk -FileName $_.FileName -chunkName $_.ChunkName -chunkData $_.ChunkData -manifest $using:manifest -targetPath $using:targetPath -counters $using:counters
+      Show-PerformanceStatsForChunk -chunkIndex $_.ChunkIndex
 
     } -ThrottleLimit $threads
   }
@@ -199,7 +199,7 @@ function Process-File {
   }
 }
 
-function Cleanup-OrphanChunks {
+function Remove-OrphanChunks {
   param(
     [hashtable]$manifest,
     [string]$targetPath,
@@ -226,7 +226,7 @@ function Cleanup-OrphanChunks {
   }
 }
 
-function Print-PerformanceStats {
+function Show-PerformanceStats {
   $totalReadTime = ($performance.ReadTimes | Measure-Object -Sum).Sum
   $totalReadBytes = ($performance.ReadSizes | Measure-Object -Sum).Sum
   $totalWriteTime = ($performance.WriteTimes | Measure-Object -Sum).Sum
@@ -274,9 +274,9 @@ function Print-PerformanceStats {
 }
 
 function Main {
-  Ensure-TargetDirectory -Path $targetPath
+  Initialize-TargetDirectory -Path $targetPath
 
-  $manifest = Load-Manifest -Path $manifestFile
+  $manifest = Get-Manifest -Path $manifestFile
 
   $counters = @{
     Total = 0
@@ -291,7 +291,7 @@ function Main {
   # Process each file
   Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
     $processedFiles[$_.Name] = $true
-    Process-File -File $_ -manifest $manifest -targetPath $targetPath -chunkSize $chunkSize -counters $counters
+    Invoke-File -File $_ -manifest $manifest -targetPath $targetPath -chunkSize $chunkSize -counters $counters
   }
 
   # Remove manifest entries for missing files
@@ -300,7 +300,7 @@ function Main {
     $manifest.Remove($_)
   }
 
-  Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath -counters $counters
+  Remove-OrphanChunks -manifest $manifest -targetPath $targetPath -counters $counters
 
   Save-Manifest -manifest $manifest -Path $manifestFile
 
@@ -311,7 +311,7 @@ function Main {
   Write-Host "Chunks untouched: $($counters.Untouched)"
   Write-Host "Chunks removed: $($counters.Outdated)"
 
-  Print-PerformanceStats
+  Show-PerformanceStats
 }
 
 # Run Main and measure total time
