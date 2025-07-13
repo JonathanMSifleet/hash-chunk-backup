@@ -4,32 +4,45 @@ $targetPath = "S:\TestBackup"
 $chunkSize = 1GB
 $manifestFile = Join-Path $targetPath "manifest.json"
 
-# Create target folder if it doesn't exist
-if (-not (Test-Path $targetPath)) {
-    New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
-}
-
-# Load existing manifest
-$manifest = @{}
-if (Test-Path $manifestFile) {
-    $json = Get-Content $manifestFile -Raw | ConvertFrom-Json
-    foreach ($key in $json.PSObject.Properties.Name) {
-        $manifest[$key] = @{}
-        foreach ($subkey in $json.$key.PSObject.Properties.Name) {
-            $manifest[$key][$subkey] = $json.$key.$subkey
-        }
+function Ensure-TargetDirectory {
+    param([string]$path)
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
 }
 
-# Hash function
-function Get-Hash([byte[]]$data) {
+function Load-Manifest {
+    param([string]$path)
+    if (Test-Path $path) {
+        $json = Get-Content $path -Raw | ConvertFrom-Json
+        $manifest = @{}
+        foreach ($file in $json.PSObject.Properties.Name) {
+            $manifest[$file] = @{}
+            foreach ($chunk in $json.$file.PSObject.Properties.Name) {
+                $manifest[$file][$chunk] = $json.$file.$chunk
+            }
+        }
+        return $manifest
+    }
+    return @{}
+}
+
+function Save-Manifest {
+    param(
+        [hashtable]$manifest,
+        [string]$path
+    )
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content $path
+}
+
+function Get-Hash {
+    param([byte[]]$data)
     if (-not $data -or $data.Length -eq 0) {
         throw "Get-Hash received null or empty data!"
     }
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
-        # Explicit cast to byte[] to resolve ambiguity
-        $hashBytes = $sha256.ComputeHash([byte[]]$data)
+        $hashBytes = $sha256.ComputeHash($data)
         return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLower()
     }
     finally {
@@ -37,106 +50,152 @@ function Get-Hash([byte[]]$data) {
     }
 }
 
-# Counters
-$totalChunks = 0
-$updatedChunks = 0
-$newChunks = 0
-$untouchedChunks = 0
-$outdatedChunks = 0
-$processedFiles = @{}
+function Write-ChunkFile {
+    param(
+        [string]$targetDir,
+        [string]$fileName,
+        [string]$chunkName,
+        [byte[]]$chunkData
+    )
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    $chunkFileName = "$baseName-$chunkName$extension.bin"
+    $chunkFilePath = Join-Path $targetDir $chunkFileName
+    [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
+}
 
-# Process files
-Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
-    $file = $_
-    $filePath = $file.FullName
+function Process-Chunk {
+    param(
+        [string]$fileName,
+        [string]$chunkName,
+        [byte[]]$chunkData,
+        [hashtable]$manifest,
+        [string]$targetPath,
+        [hashtable]$counters
+    )
+    $chunkHash = Get-Hash $chunkData
+
+    if (-not $manifest[$fileName].ContainsKey($chunkName)) {
+        Write-Host "  Creating new chunk $chunkName (Hash: $chunkHash)"
+        $manifest[$fileName][$chunkName] = $chunkHash
+        Write-ChunkFile -targetDir $targetPath -fileName $fileName -chunkName $chunkName -chunkData $chunkData
+        $counters["New"]++
+    }
+    elseif ($manifest[$fileName][$chunkName] -ne $chunkHash) {
+        Write-Host "  Updating chunk $chunkName (Hash: $chunkHash)"
+        $manifest[$fileName][$chunkName] = $chunkHash
+        Write-ChunkFile -targetDir $targetPath -fileName $fileName -chunkName $chunkName -chunkData $chunkData
+        $counters["Updated"]++
+    }
+    else {
+        Write-Host "  Chunk $chunkName unchanged, skipping."
+        $counters["Untouched"]++
+    }
+
+    $counters["Total"]++
+}
+
+function Process-File {
+    param(
+        [System.IO.FileInfo]$file,
+        [hashtable]$manifest,
+        [string]$targetPath,
+        [int64]$chunkSize,
+        [hashtable]$counters
+    )
     $fileName = $file.Name
-    $processedFiles[$fileName] = $true
-
-    Write-Host "Processing file: $filePath"
 
     if (-not $manifest.ContainsKey($fileName)) {
         $manifest[$fileName] = @{}
     }
 
-    $stream = [System.IO.File]::OpenRead($filePath)
+    Write-Host "Processing file: $($file.FullName)"
+    $stream = [System.IO.File]::OpenRead($file.FullName)
     try {
-        $chunkIndex = 0
         $buffer = New-Object byte[] $chunkSize
-
+        $chunkIndex = 0
         while (($bytesRead = $stream.Read($buffer, 0, $chunkSize)) -gt 0) {
-            # Defensive check (should not be needed, but just in case)
-            if ($bytesRead -le 0) { break }
-
-            # Copy only the bytes read into a new array
-            $chunkData = New-Object byte[] $bytesRead
-            [Array]::Copy($buffer, 0, $chunkData, 0, $bytesRead)
-
-            $chunkHash = Get-Hash $chunkData
-            $chunkName = "chunk$chunkIndex"
-
-            $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-            $fileExtension = [System.IO.Path]::GetExtension($fileName)
-            $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
-            $chunkFilePath = Join-Path $targetPath $chunkFileName
-
-            if (-not $manifest[$fileName].ContainsKey($chunkName)) {
-                Write-Host "  Creating new chunk #$chunkIndex (Hash: $chunkHash)"
-                $manifest[$fileName][$chunkName] = $chunkHash
-                [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-                $newChunks++
-            } elseif ($manifest[$fileName][$chunkName] -ne $chunkHash) {
-                Write-Host "  Updating chunk #$chunkIndex (Hash: $chunkHash)"
-                $manifest[$fileName][$chunkName] = $chunkHash
-                [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-                $updatedChunks++
-            } else {
-                Write-Host "  Chunk #$chunkIndex unchanged, skipping."
-                $untouchedChunks++
+            if ($bytesRead -eq $chunkSize) {
+                $chunkData = $buffer
             }
-
-            $totalChunks++
+            else {
+                $chunkData = New-Object byte[] $bytesRead
+                [System.Buffer]::BlockCopy($buffer, 0, $chunkData, 0, $bytesRead)
+            }
+            $chunkName = "chunk$chunkIndex"
+            Process-Chunk -fileName $fileName -chunkName $chunkName -chunkData $chunkData -manifest $manifest -targetPath $targetPath -counters $counters
             $chunkIndex++
         }
     }
     finally {
-        $stream.Close()
         $stream.Dispose()
     }
 }
 
-# Clean manifest entries for files no longer present
-$manifest.Keys | Where-Object { -not $processedFiles.ContainsKey($_) } | ForEach-Object {
-    Write-Host "Removing obsolete manifest entry: $_"
-    $manifest.Remove($_)
-}
+function Cleanup-OrphanChunks {
+    param(
+        [hashtable]$manifest,
+        [string]$targetPath,
+        [hashtable]$counters
+    )
+    # Build set of valid chunk file names
+    $validChunks = @{}
+    foreach ($fileName in $manifest.Keys) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+        $extension = [System.IO.Path]::GetExtension($fileName)
+        foreach ($chunkName in $manifest[$fileName].Keys) {
+            $chunkFileName = "$baseName-$chunkName$extension.bin"
+            $validChunks[$chunkFileName] = $true
+        }
+    }
 
-# Track all valid chunk files
-$validChunkFiles = @{}
-foreach ($fileName in $manifest.Keys) {
-    $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-    $fileExtension = [System.IO.Path]::GetExtension($fileName)
-    foreach ($chunkName in $manifest[$fileName].Keys) {
-        $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
-        $validChunkFiles[$chunkFileName] = $true
+    # Remove orphaned chunk files
+    Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
+        if (-not $validChunks.ContainsKey($_.Name)) {
+            Write-Host "  Removing outdated chunk: $($_.FullName)"
+            Remove-Item $_.FullName -Force
+            $counters["Outdated"]++
+        }
     }
 }
 
-# Delete orphaned chunks
-Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
-    if (-not $validChunkFiles.ContainsKey($_.Name)) {
-        Write-Host "  Removing outdated chunk: $($_.FullName)"
-        Remove-Item $_.FullName -Force
-        $outdatedChunks++
+function Main {
+    Ensure-TargetDirectory -path $targetPath
+
+    $manifest = Load-Manifest -path $manifestFile
+
+    $counters = @{
+        Total = 0
+        New = 0
+        Updated = 0
+        Untouched = 0
+        Outdated = 0
     }
+
+    $processedFiles = @{}
+
+    # Process each file
+    Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
+        $processedFiles[$_.Name] = $true
+        Process-File -file $_ -manifest $manifest -targetPath $targetPath -chunkSize $chunkSize -counters $counters
+    }
+
+    # Remove manifest entries for missing files
+    $manifest.Keys | Where-Object { -not $processedFiles.ContainsKey($_) } | ForEach-Object {
+        Write-Host "Removing obsolete manifest entry: $_"
+        $manifest.Remove($_)
+    }
+
+    Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath -counters $counters
+
+    Save-Manifest -manifest $manifest -path $manifestFile
+
+    Write-Host "`nChunking complete."
+    Write-Host "Total chunks processed: $($counters.Total)"
+    Write-Host "New chunks created: $($counters.New)"
+    Write-Host "Chunks updated: $($counters.Updated)"
+    Write-Host "Chunks untouched: $($counters.Untouched)"
+    Write-Host "Chunks removed: $($counters.Outdated)"
 }
 
-# Save manifest
-$manifest | ConvertTo-Json -Depth 10 | Set-Content $manifestFile
-
-# Summary
-Write-Host "`nChunking complete."
-Write-Host "Total chunks processed: $totalChunks"
-Write-Host "New chunks created: $newChunks"
-Write-Host "Chunks updated: $updatedChunks"
-Write-Host "Chunks untouched: $untouchedChunks"
-Write-Host "Chunks removed: $outdatedChunks"
+Main
