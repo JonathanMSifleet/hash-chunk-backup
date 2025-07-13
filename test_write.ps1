@@ -4,6 +4,14 @@ $targetPath = "S:\TestBackup"
 $chunkSize = 1GB
 $manifestFile = Join-Path $targetPath "manifest.json"
 
+# Performance tracking
+$performance = @{
+  ReadTimes = @()
+  ReadSizes = @()
+  WriteTimes = @()
+  WriteSizes = @()
+}
+
 function Ensure-TargetDirectory {
   param([string]$path)
   if (-not (Test-Path $path)) {
@@ -61,7 +69,7 @@ function Write-ChunkFile {
   $extension = [System.IO.Path]::GetExtension($fileName)
   $chunkFileName = "$baseName-$chunkName$extension.bin"
   $chunkFilePath = Join-Path $targetDir $chunkFileName
-  [System.IO.File]::WriteAllBytes($chunkFilePath,$chunkData)
+  [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
 }
 
 function Process-Chunk {
@@ -73,7 +81,10 @@ function Process-Chunk {
     [string]$targetPath,
     [hashtable]$counters
   )
+
   $chunkHash = Get-Hash $chunkData
+
+  $writeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
   if (-not $manifest[$fileName].ContainsKey($chunkName)) {
     Write-Host "  Creating new chunk $chunkName (Hash: $chunkHash)"
@@ -89,10 +100,40 @@ function Process-Chunk {
   }
   else {
     Write-Host "  Chunk $chunkName unchanged, skipping."
+    $writeStopwatch.Stop()
+    # Skipped write, record no time or size for write
     $counters["Untouched"]++
+    return
   }
 
-  $counters["Total"]++
+  $writeStopwatch.Stop()
+  $performance.WriteTimes += $writeStopwatch.Elapsed.TotalSeconds
+  $performance.WriteSizes += $chunkData.Length
+}
+
+function Print-PerformanceStatsForChunk {
+  param([int]$chunkIndex)
+
+  $readTime = $performance.ReadTimes[$chunkIndex]
+  $readBytes = $performance.ReadSizes[$chunkIndex]
+
+  if ($chunkIndex -lt $performance.WriteTimes.Count) {
+    $writeTime = $performance.WriteTimes[$chunkIndex]
+    $writeBytes = $performance.WriteSizes[$chunkIndex]
+  } else {
+    $writeTime = 0
+    $writeBytes = 0
+  }
+
+  $readSpeed = if ($readTime -gt 0) { $readBytes / $readTime / 1MB } else { 0 }
+  $writeSpeed = if ($writeTime -gt 0) { $writeBytes / $writeTime / 1MB } else { 0 }
+
+  $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+
+  Write-Host "$timestamp - Chunk $chunkIndex performance:"
+  Write-Host ("  Read time: {0:N3} s, Read size: {1} bytes, Read speed: {2:N2} MB/s" -f $readTime, $readBytes, $readSpeed)
+  Write-Host ("  Write time: {0:N3} s, Write size: {1} bytes, Write speed: {2:N2} MB/s" -f $writeTime, $writeBytes, $writeSpeed)
+  Write-Host ""
 }
 
 function Process-File {
@@ -114,16 +155,27 @@ function Process-File {
   try {
     $buffer = New-Object byte[] $chunkSize
     $chunkIndex = 0
-    while (($bytesRead = $stream.Read($buffer,0,$chunkSize)) -gt 0) {
+    while (($bytesRead = $stream.Read($buffer, 0, $chunkSize)) -gt 0) {
+      $readStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
       if ($bytesRead -eq $chunkSize) {
         $chunkData = $buffer
       }
       else {
         $chunkData = New-Object byte[] $bytesRead
-        [System.Buffer]::BlockCopy($buffer,0,$chunkData,0,$bytesRead)
+        [System.Buffer]::BlockCopy($buffer, 0, $chunkData, 0, $bytesRead)
       }
+
+      $readStopwatch.Stop()
+      $performance.ReadTimes += $readStopwatch.Elapsed.TotalSeconds
+      $performance.ReadSizes += $bytesRead
+
       $chunkName = "chunk$chunkIndex"
       Process-Chunk -FileName $fileName -chunkName $chunkName -chunkData $chunkData -manifest $manifest -targetPath $targetPath -counters $counters
+
+      # Print incremental performance stats for this chunk
+      Print-PerformanceStatsForChunk -chunkIndex $chunkIndex
+
       $chunkIndex++
     }
   }
@@ -159,6 +211,53 @@ function Cleanup-OrphanChunks {
   }
 }
 
+function Print-PerformanceStats {
+  $totalReadTime = ($performance.ReadTimes | Measure-Object -Sum).Sum
+  $totalReadBytes = ($performance.ReadSizes | Measure-Object -Sum).Sum
+  $totalWriteTime = ($performance.WriteTimes | Measure-Object -Sum).Sum
+  $totalWriteBytes = ($performance.WriteSizes | Measure-Object -Sum).Sum
+  $totalChunks = $performance.ReadTimes.Count
+
+  if ($totalReadTime -gt 0) {
+    $avgReadSpeed = $totalReadBytes / $totalReadTime / 1MB
+  } else { $avgReadSpeed = 0 }
+
+  if ($totalWriteTime -gt 0) {
+    $avgWriteSpeed = $totalWriteBytes / $totalWriteTime / 1MB
+  } else { $avgWriteSpeed = 0 }
+
+  $peakReadSpeed = 0
+  for ($i = 0; $i -lt $totalChunks; $i++) {
+    if ($performance.ReadTimes[$i] -gt 0) {
+      $speed = $performance.ReadSizes[$i] / $performance.ReadTimes[$i] / 1MB
+      if ($speed -gt $peakReadSpeed) { $peakReadSpeed = $speed }
+    }
+  }
+
+  $peakWriteSpeed = 0
+  for ($i = 0; $i -lt $totalChunks; $i++) {
+    if ($performance.WriteTimes[$i] -gt 0) {
+      $speed = $performance.WriteSizes[$i] / $performance.WriteTimes[$i] / 1MB
+      if ($speed -gt $peakWriteSpeed) { $peakWriteSpeed = $speed }
+    }
+  }
+
+  $avgReadTimePerChunk = if ($totalChunks -gt 0) { $totalReadTime / $totalChunks } else { 0 }
+  $avgWriteTimePerChunk = if ($totalChunks -gt 0) { $totalWriteTime / $totalChunks } else { 0 }
+
+  Write-Host "`n=== Performance Stats ==="
+  Write-Host ("Total chunks processed: $totalChunks")
+  Write-Host ("Total read time: {0:N2} s" -f $totalReadTime)
+  Write-Host ("Total write time: {0:N2} s" -f $totalWriteTime)
+  Write-Host ("Average read speed: {0:N2} MB/s" -f $avgReadSpeed)
+  Write-Host ("Average write speed: {0:N2} MB/s" -f $avgWriteSpeed)
+  Write-Host ("Peak read speed: {0:N2} MB/s" -f $peakReadSpeed)
+  Write-Host ("Peak write speed: {0:N2} MB/s" -f $peakWriteSpeed)
+  Write-Host ("Average read time per chunk: {0:N3} s" -f $avgReadTimePerChunk)
+  Write-Host ("Average write time per chunk: {0:N3} s" -f $avgWriteTimePerChunk)
+  Write-Host "=========================`n"
+}
+
 function Main {
   Ensure-TargetDirectory -Path $targetPath
 
@@ -166,7 +265,7 @@ function Main {
 
   $counters = @{
     Total = 0
-    new = 0
+    New = 0
     Updated = 0
     Untouched = 0
     Outdated = 0
@@ -191,12 +290,13 @@ function Main {
   Save-Manifest -manifest $manifest -Path $manifestFile
 
   Write-Host "`nChunking complete."
-  Write-Host "Total chunks processed: $($counters.Total)"
+  Write-Host "Total chunks processed: $($performance.ReadTimes.Count)"
   Write-Host "New chunks created: $($counters.New)"
   Write-Host "Chunks updated: $($counters.Updated)"
   Write-Host "Chunks untouched: $($counters.Untouched)"
   Write-Host "Chunks removed: $($counters.Outdated)"
-}
 
+  Print-PerformanceStats
+}
 
 Main
