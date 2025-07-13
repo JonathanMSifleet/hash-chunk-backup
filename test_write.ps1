@@ -114,6 +114,29 @@ Get-ChildItem -Path $sourcePath -Recurse -File | ForEach-Object {
     }
 }
 
+# Identify and remove outdated chunks
+$outdatedChunks = 0
+$existingChunkFiles = @{}
+
+# Track all currently valid chunk file names
+foreach ($fileName in $manifest.Keys) {
+    $safeFileName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+    $fileExtension = [System.IO.Path]::GetExtension($fileName)
+    foreach ($chunkName in $manifest[$fileName].Keys) {
+        $chunkFileName = "$safeFileName-$chunkName$($fileExtension).bin"
+        $existingChunkFiles[$chunkFileName] = $true
+    }
+}
+
+# Delete any .bin files in the target directory not referenced in the updated manifest
+Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
+    if (-not $existingChunkFiles.ContainsKey($_.Name)) {
+        Write-Host "  Removing outdated chunk: $($_.FullName)"
+        Remove-Item $_.FullName -Force
+        $outdatedChunks++
+    }
+}
+
 # Save updated manifest
 $manifest | ConvertTo-Json -Depth 10 | Set-Content $manifestFile
 
@@ -123,3 +146,4 @@ Write-Host "Total chunks processed: $totalChunks"
 Write-Host "New chunks created: $newChunks"
 Write-Host "Chunks updated: $updatedChunks"
 Write-Host "Chunks untouched: $untouchedChunks"
+Write-Host "Chunks removed: $outdatedChunks"
