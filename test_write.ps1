@@ -3,6 +3,7 @@ $sourcePath = "C:\Media\Zips"
 $targetPath = "S:\TestBackup"
 $chunkSize = 1GB
 $manifestFile = Join-Path $targetPath "manifest.json"
+$threads = [Environment]::ProcessorCount
 
 # Performance tracking
 $performance = @{
@@ -191,7 +192,7 @@ function Process-File {
       Process-Chunk -FileName $_.FileName -chunkName $_.ChunkName -chunkData $_.ChunkData -manifest $using:manifest -targetPath $using:targetPath -counters $using:counters
       Print-PerformanceStatsForChunk -chunkIndex $_.ChunkIndex
 
-    } -ThrottleLimit 4
+    } -ThrottleLimit $threads
   }
   finally {
     $stream.Dispose()
