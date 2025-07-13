@@ -20,7 +20,6 @@ This is still a work in progress, so it does not work as intended yet.
 
 TODO:
 - Write percentage of file read
-- Split into different files if possible
-- Fix not deleting orphaned chunks
-- Fix RAM usage
-- Parrallelize chunk creation (hash calculation and file writing)
+- Verify not deleting orphaned chunks
+- Improve RAM usage
+- Refactor
