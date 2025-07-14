@@ -19,8 +19,9 @@ Current logic:
 This is still a work in progress, so it does not work as intended yet.
 
 TODO:
+- Fix RAM usage
+- Fix file read speed
 - Speed up rabin calculation
-- Reduce RAM usage
 - Write current speed of file read
 - Verify not deleting orphaned chunks
 - Refactor
