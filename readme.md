@@ -19,7 +19,9 @@ Current logic:
 This is still a work in progress, so it does not work as intended yet.
 
 TODO:
-- Write percentage of file read
+- Speed up rabin calculation
+- Reduce RAM usage
+- Write current speed of file read
 - Verify not deleting orphaned chunks
-- Improve RAM usage
 - Refactor
+- GUI wrapper

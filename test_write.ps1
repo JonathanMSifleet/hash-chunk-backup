@@ -1,27 +1,26 @@
 # === Settings ===
-$sourcePath = "S:\Source"          # Change to your source directory
-$targetPath = "T:\Backup"          # Change to your backup directory
+$sourcePath = "S:\Source"
+$targetPath = "T:\Backup"
 $manifestFile = Join-Path $targetPath "manifest.json"
 
-$chunkSizeMB = 256                 # Chunk size in MB (adjust as needed)
-$chunkSize = $chunkSizeMB * 1MB
+$avgChunkSize = 256MB
+$minChunkSize = 64KB
+$maxChunkSize = 512MB
 
-# Get number of logical CPU threads
+$rabinWindowSize = 48
+$rabinPolynomial = 8286094103145083 # Example 53-bit irreducible poly
+
 $cpuThreads = [Environment]::ProcessorCount
-
-# Set batch size and throttle limit to CPU thread count
-$batchSize = $cpuThreads
 $throttleLimit = $cpuThreads
 
-# === Performance tracking ===
-$performance = @{
-    ReadTimes = @()
-    ReadSizes = @()
-    WriteTimes = @()
-    WriteSizes = @()
+# === Load Manifest ===
+if (Test-Path $manifestFile) {
+    $manifest = ConvertFrom-Json (Get-Content $manifestFile -Raw) -AsHashtable
+} else {
+    $manifest = @{}
 }
 
-# === Helper Functions ===
+# === Utility Functions ===
 
 function Ensure-TargetDirectory {
     param([string]$path)
@@ -30,205 +29,224 @@ function Ensure-TargetDirectory {
     }
 }
 
-function Cleanup-OrphanChunks {
-    param(
-        [hashtable]$manifest,
-        [string]$targetPath,
-        [ref]$counters
-    )
-    $validChunks = @{}
-    foreach ($fileName in $manifest.Keys) {
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-        $extension = [System.IO.Path]::GetExtension($fileName)
-        foreach ($chunkName in $manifest[$fileName].Keys) {
-            $chunkFileName = "$baseName-$chunkName$extension.bin"
-            $validChunks[$chunkFileName] = $true
-        }
-    }
-
-    Get-ChildItem -Path $targetPath -Filter *.bin | ForEach-Object {
-        if (-not $validChunks.ContainsKey($_.Name)) {
-            Write-Host "Removing outdated chunk: $($_.FullName)"
-            Remove-Item $_.FullName -Force
-            $counters.Value["Outdated"]++
-        }
-    }
-}
-
 function Save-Manifest {
-    param(
-        [hashtable]$manifest,
-        [string]$path
-    )
+    param([hashtable]$manifest, [string]$path)
     $manifest | ConvertTo-Json -Depth 10 | Set-Content $path
 }
 
-function Write-ChunkFile {
-    param(
-        [string]$targetDir,
-        [string]$fileName,
-        [string]$chunkName,
-        [byte[]]$chunkData,
-        [int64]$totalFileSize,
-        [int64]$bytesWrittenSoFar,
-        [ref]$stopwatch,
-        [int]$chunkIndex,
-        [int]$totalChunks
-    )
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
-    $extension = [System.IO.Path]::GetExtension($fileName)
-    $chunkFileName = "$baseName-$chunkName$extension.bin"
-    $chunkFilePath = Join-Path $targetDir $chunkFileName
-
-    $writeStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    [System.IO.File]::WriteAllBytes($chunkFilePath, $chunkData)
-    $writeStopwatch.Stop()
-
-    $performance.WriteTimes += $writeStopwatch.Elapsed.TotalSeconds
-    $performance.WriteSizes += $chunkData.Length
-
-    $percent = [math]::Round(($bytesWrittenSoFar / $totalFileSize) * 100, 2)
-    $elapsed = $stopwatch.Value.Elapsed.TotalSeconds
-    $etaFormatted = "Calculating..."
-    if ($bytesWrittenSoFar -gt 0) {
-        $rate = $bytesWrittenSoFar / $elapsed
-        $remaining = $totalFileSize - $bytesWrittenSoFar
-        $etaSeconds = $remaining / $rate
-        $etaFormatted = [timespan]::FromSeconds($etaSeconds).ToString("hh\:mm\:ss")
+function Cleanup-OrphanChunks {
+    param([hashtable]$manifest, [string]$targetPath)
+    $validChunks = @{}
+    foreach ($entry in $manifest.Values) {
+        foreach ($chunkHash in $entry.ChunkHashes) {
+            $validChunks["$chunkHash.bin"] = $true
+        }
     }
-
-    $writeSpeedMBps = if ($writeStopwatch.Elapsed.TotalSeconds -gt 0) {
-        $chunkData.Length / $writeStopwatch.Elapsed.TotalSeconds / 1MB
+    Get-ChildItem -Path $targetPath -Filter "*.bin" | ForEach-Object {
+        if (-not $validChunks.ContainsKey($_.Name)) {
+            Remove-Item $_.FullName -Force
+            Write-Host "Removed orphaned chunk: $($_.Name)"
+        }
     }
-    else {
-        0
-    }
-
-    $chunksRemaining = $totalChunks - ($chunkIndex + 1)
-    Write-Host ("    Chunk written: {0}, Size: {1} bytes, Time: {2:N3} s, Speed: {3:N2} MB/s, Chunks remaining: {4}" -f `
-         $chunkName, $chunkData.Length, $writeStopwatch.Elapsed.TotalSeconds, $writeSpeedMBps, $chunksRemaining)
-    Write-Host ("    Progress: {0}%   ETA: {1}" -f $percent, $etaFormatted)
 }
 
-# === Main Script ===
+function Get-RabinChunkBoundaries {
+    param(
+        [byte[]]$data,
+        [int64]$poly,
+        [int]$avgSize,
+        [int]$minSize,
+        [int]$maxSize,
+        [int]$windowSize
+    )
 
-Write-Host "Starting backup..."
-Write-Host "Using $cpuThreads CPU threads for batch size and parallelism."
+    # Simplified Rabin fingerprint simulation for demo purposes
+    $modulus = [math]::Pow(2,53) - 1  # approximate 53-bit modulus
+    $mask = $avgSize - 1
+    $hash = 0
+    $chunks = @()
+    $start = 0
+    $length = $data.Length
+
+    for ($i = 0; $i -lt $length; $i++) {
+        $hash = (($hash -shl 1) + $data[$i]) % $modulus
+        $chunkLen = $i - $start + 1
+
+        if (
+            ($chunkLen -ge $minSize -and ($hash -band $mask) -eq 0) -or
+            $chunkLen -ge $maxSize
+        ) {
+            $chunks += ,@($start, $chunkLen)
+            $start = $i + 1
+        }
+    }
+
+    if ($start -lt $length) {
+        $finalLen = $length - $start
+        $chunks += ,@($start, $finalLen)
+    }
+
+    return $chunks
+}
+
+function Compute-Sha256Hash {
+    param([byte[]]$data)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash($data)
+        return ([BitConverter]::ToString($hash) -replace "-", "").ToLower()
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+# === Start ===
+$globalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+Write-Host "Starting content-defined backup with Rabin Fingerprinting..."
+Write-Host "Detected $cpuThreads logical threads"
 
 Ensure-TargetDirectory -Path $targetPath
 
-if (Test-Path $manifestFile) {
-    $manifest = ConvertFrom-Json (Get-Content $manifestFile -Raw) -AsHashtable
-}
-else {
-    $manifest = @{}
-}
-
-$counters = @{ New = 0; Updated = 0; Unchanged = 0; Outdated = 0 }
+$counters = @{ New = 0; Unchanged = 0; TotalBytesWritten = 0 }
+$totalChunks = 0
+$totalDataBytes = 0
 
 $files = Get-ChildItem -Path $sourcePath -File -Recurse
 
+# Constants for reading progress
+$progressIntervalSec = 3
+
 foreach ($file in $files) {
-    Write-Host "Processing file: $($file.FullName)"
-    $stream = [System.IO.File]::OpenRead($file.FullName)
-    $chunkIndex = 0
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $totalChunks = [math]::Ceiling($file.Length / $chunkSize)
-    $bytesWrittenSoFar = 0
+    Write-Host "Processing: $($file.FullName)"
+    $fileStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $stream = $file.OpenRead()
+    $reader = New-Object System.IO.BinaryReader($stream)
+
+    $chunks = @()
+    $offset = 0
+    $fileLength = $stream.Length
+    $lastProgressUpdate = [DateTime]::UtcNow
+
+    $bufferSize = 1MB  # Smaller buffer for more frequent progress updates
 
     try {
-        $chunksBatch = @()
+        while ($offset -lt $fileLength) {
+            $remaining = $fileLength - $offset
+            $toRead = if ($remaining -gt $bufferSize) { $bufferSize } else { $remaining }
 
-        while ($true) {
-            # Calculate how many bytes to read (last chunk may be smaller)
-            $remainingBytes = $file.Length - ($chunkIndex * $chunkSize)
-            if ($remainingBytes -le 0) { break }
-            $bytesToRead = if ($remainingBytes -gt $chunkSize) { $chunkSize } else { [int]$remainingBytes }
+            $data = $reader.ReadBytes([int]$toRead)
+            if ($data.Length -eq 0) { break }
 
-            $buffer = New-Object byte[] $bytesToRead
-            $bytesRead = $stream.Read($buffer, 0, $bytesToRead)
-            if ($bytesRead -le 0) { break }
+            # Get chunk boundaries within this data block
+            $boundaries = Get-RabinChunkBoundaries -data $data -poly $rabinPolynomial `
+                -avgSize $avgChunkSize -minSize $minChunkSize -maxSize $maxChunkSize -windowSize $rabinWindowSize
 
-            # Store chunk info for batch processing
-            $chunksBatch += [pscustomobject]@{
-                Index = $chunkIndex
-                Data  = $buffer
-            }
-
-            # When batch full or last chunk, process batch
-            if ($chunksBatch.Count -ge $batchSize -or $bytesRead -lt $chunkSize) {
-
-                # Parallel hash computation
-                $hashResults = $chunksBatch | ForEach-Object -Parallel {
-                    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-                    try {
-                        $hashBytes = $sha256.ComputeHash($_.Data)
-                    }
-                    finally {
-                        $sha256.Dispose()
-                    }
-                    [pscustomobject]@{
-                        Index = $_.Index
-                        Hash  = ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLower()
-                        Data  = $_.Data
-                    }
-                } -ThrottleLimit $throttleLimit
-
-                foreach ($chunk in $hashResults) {
-                    $chunkName = $chunk.Index.ToString()
-                    if (-not $manifest.ContainsKey($file.Name)) {
-                        $manifest[$file.Name] = @{}
-                    }
-                    $existingHash = if ($manifest[$file.Name].ContainsKey($chunkName)) { $manifest[$file.Name][$chunkName] } else { "" }
-
-                    if ($existingHash -ne $chunk.Hash) {
-                        $bytesWrittenSoFar += $chunk.Data.Length
-                        Write-ChunkFile -targetDir $targetPath -FileName $file.Name -chunkName $chunkName -chunkData $chunk.Data `
-                           -totalFileSize $file.Length -bytesWrittenSoFar $bytesWrittenSoFar -stopwatch ([ref]$stopwatch) `
-                           -chunkIndex $chunk.Index -totalChunks $totalChunks
-
-                        if ($existingHash -eq "") {
-                            $counters["New"]++
-                            Write-Host "  New chunk $chunkName"
-                        }
-                        else {
-                            $counters["Updated"]++
-                            Write-Host "  Updated chunk $chunkName"
-                        }
-                        $manifest[$file.Name][$chunkName] = $chunk.Hash
-                        Save-Manifest -manifest $manifest -Path $manifestFile
-                    }
-                    else {
-                        $counters["Unchanged"]++
-                        $bytesWrittenSoFar += $chunk.Data.Length
-                        $percent = [math]::Round(($bytesWrittenSoFar / $file.Length) * 100, 2)
-                        $elapsed = $stopwatch.Elapsed.TotalSeconds
-                        $etaFormatted = "Calculating..."
-                        if ($bytesWrittenSoFar -gt 0) {
-                            $rate = $bytesWrittenSoFar / $elapsed
-                            $remaining = $file.Length - $bytesWrittenSoFar
-                            $etaSeconds = $remaining / $rate
-                            $etaFormatted = [timespan]::FromSeconds($etaSeconds).ToString("hh\:mm\:ss")
-                        }
-                        Write-Host ("    Progress: {0}%   ETA: {1}" -f $percent, $etaFormatted)
-                    }
+            foreach ($b in $boundaries) {
+                $start = $b[0]
+                $length = $b[1]
+                if ($start + $length -gt $data.Length) { continue }
+                $chunkData = $data[$start..($start + $length - 1)]
+                $chunks += [PSCustomObject]@{
+                    Offset = $offset + $start
+                    Data   = $chunkData
                 }
-
-                $chunksBatch = @() # reset batch
             }
 
-            $chunkIndex++
+            $offset += $data.Length
+
+            # Update reading progress every $progressIntervalSec seconds or on last chunk
+            $now = [DateTime]::UtcNow
+            if (($now - $lastProgressUpdate).TotalSeconds -ge $progressIntervalSec -or $offset -ge $fileLength) {
+                $percent = [math]::Round(($offset / $fileLength) * 100, 2)
+                $remainingPercent = 100 - $percent
+
+                $elapsed = $fileStopwatch.Elapsed.TotalSeconds
+                $etaSeconds = if ($offset -gt 0) {
+                    $elapsed * ($fileLength - $offset) / $offset
+                } else { 0 }
+                $etaTimeSpan = [TimeSpan]::FromSeconds($etaSeconds)
+                $etaString = '{0:D2}:{1:D2}:{2:D2}' -f $etaTimeSpan.Hours, $etaTimeSpan.Minutes, $etaTimeSpan.Seconds
+
+                Write-Host -NoNewline ("`rReading {0} [Progress: {1}% | Remaining: {2}% | ETA: {3}]    " -f $file.Name, $percent, $remainingPercent, $etaString)
+                [Console]::Out.Flush()
+                $lastProgressUpdate = $now
+            }
         }
     }
     finally {
-        $stream.Dispose()
+        $reader.Close()
+        $stream.Close()
     }
+
+    # End progress line with newline
+    Write-Host ""
+
+    $totalChunks += $chunks.Count
+    $totalDataBytes += ($chunks | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
+
+    # === Hash all chunks in parallel ===
+    $results = $chunks | ForEach-Object -Parallel {
+        function Compute-Sha256Hash {
+            param([byte[]]$data)
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hash = $sha256.ComputeHash($data)
+                return ([BitConverter]::ToString($hash) -replace "-", "").ToLower()
+            } finally {
+                $sha256.Dispose()
+            }
+        }
+        $hash = Compute-Sha256Hash -data $_.Data
+        [PSCustomObject]@{
+            Offset = $_.Offset
+            Data   = $_.Data
+            Hash   = $hash
+        }
+    } -ThrottleLimit $throttleLimit
+
+    # Ensure manifest entry exists
+    if (-not $manifest.ContainsKey($file.FullName)) {
+        $manifest[$file.FullName] = @{ ChunkHashes = @() }
+    }
+
+    # === Write chunks and update manifest sequentially ===
+    foreach ($chunk in $results) {
+        $hash = $chunk.Hash
+        $chunkFile = Join-Path $targetPath "$hash.bin"
+
+        if (-not $manifest[$file.FullName].ChunkHashes.Contains($hash)) {
+            if (-not (Test-Path $chunkFile)) {
+                [System.IO.File]::WriteAllBytes($chunkFile, $chunk.Data)
+                $counters["New"]++
+                $counters["TotalBytesWritten"] += $chunk.Data.Length
+                Write-Host "  New chunk: $hash"
+            } else {
+                Write-Host "  Chunk already exists: $hash"
+            }
+            $manifest[$file.FullName].ChunkHashes += $hash
+        } else {
+            $counters["Unchanged"]++
+        }
+    }
+
+    $fileStopwatch.Stop()
+    Write-Host ("Finished {0} in {1:N2} sec ({2:N2} MB)" -f `
+        $file.Name, $fileStopwatch.Elapsed.TotalSeconds, ($file.Length / 1MB))
 }
 
-Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath -counters ([ref]$counters)
-
+Cleanup-OrphanChunks -manifest $manifest -targetPath $targetPath
 Save-Manifest -manifest $manifest -Path $manifestFile
 
-Write-Host "Backup complete."
+$globalStopwatch.Stop()
 
-Write-Host "Chunks new: $($counters.New), updated: $($counters.Updated), unchanged: $($counters.Unchanged), removed outdated: $($counters.Outdated)"
+# === Metrics Summary ===
+$duration = $globalStopwatch.Elapsed.TotalSeconds
+$totalMB = $counters["TotalBytesWritten"] / 1MB
+$speed = if ($duration -gt 0) { $totalMB / $duration } else { 0 }
+
+Write-Host "`nBackup complete."
+Write-Host "Chunks new: $($counters.New), unchanged: $($counters.Unchanged)"
+Write-Host ("Total MB written: {0:N2}" -f $totalMB)
+Write-Host ("Total time: {0:N2} seconds" -f $duration)
+Write-Host ("Average speed: {0:N2} MB/sec" -f $speed)
